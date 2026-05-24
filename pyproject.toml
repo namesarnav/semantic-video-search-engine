@@ -1,0 +1,35 @@
+[project]
+name = "sv-engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Arnav Verma", email = "arnavverma522@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "faiss-cpu>=1.15.0",
+    "fastapi>=0.141.1",
+    "numpy>=2.5.2",
+    "open-clip-torch>=3.3.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=12.3.0",
+    "python-multipart>=0.0.32",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[project.scripts]
+sv-engine = "sv_engine:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
