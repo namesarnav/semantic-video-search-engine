@@ -1,10 +1,10 @@
 """Frame sampling.
 
-The core ingestion trade-off: sampling densely (every frame) produces mostly
-near-duplicate embeddings and wastes storage and search time; sampling sparsely
+The core ingestion trade off: sampling densely (every frame) produces mostly
+near duplicate embeddings and wastes storage and search time; sampling sparsely
 (every 10s) misses short, visually distinct moments.
 
-The strategy here is scene-change-aware: take a fixed baseline rate, and insert
+The strategy here is scene change aware: take a fixed baseline rate, and insert
 *extra* samples where the picture actually changes. Both strategies are exposed
 so they can be A/B'd against Recall@K rather than assumed.
 """
@@ -70,8 +70,14 @@ def sample_video(
     Set ``scene_threshold=None`` for pure fixed-interval sampling -- that is the
     control arm when measuring whether scene-awareness actually improves recall.
 
-    ``min_gap_sec`` stops a fast-cutting or shaky sequence from emitting a burst
-    of near-identical scene-cut samples.
+    ``min_gap_sec`` is the minimum spacing between consecutive *scene-cut*
+    samples, so a fast-cutting or shaky sequence cannot emit a burst of them.
+
+    It deliberately does not measure against baseline samples. A cut landing
+    just after a baseline tick is the one case where a closely-spaced sample is
+    certainly not a duplicate -- the picture just changed, which is the whole
+    reason it was flagged. Throttling against baseline would leave the opening
+    of every new scene unrepresented until the next tick.
     """
     path = Path(path)
     capture = cv2.VideoCapture(str(path))
@@ -86,7 +92,7 @@ def sample_video(
         baseline_interval = 1.0 / baseline_fps if baseline_fps > 0 else float("inf")
 
         prev_frame: np.ndarray | None = None
-        last_emit_ts = -float("inf")
+        last_cut_ts = -float("inf")
         next_baseline_ts = 0.0
         frame_index = -1
 
@@ -101,7 +107,12 @@ def sample_video(
             if timestamp >= next_baseline_ts:
                 reason = "baseline"
             elif scene_threshold is not None and prev_frame is not None:
-                if scene_distance(prev_frame, frame) >= scene_threshold:
+                # Throttle cuts against the previous *cut* only. See the
+                # docstring: a cut near a baseline tick is not a duplicate.
+                if (
+                    scene_distance(prev_frame, frame) >= scene_threshold
+                    and timestamp - last_cut_ts >= min_gap_sec
+                ):
                     reason = "scene_cut"
 
             # Only the previous *compared* frame matters for cut detection, so
@@ -110,11 +121,10 @@ def sample_video(
 
             if reason is None:
                 continue
-            if timestamp - last_emit_ts < min_gap_sec:
-                continue
 
-            last_emit_ts = timestamp
-            if reason == "baseline":
+            if reason == "scene_cut":
+                last_cut_ts = timestamp
+            else:
                 # Advance past the current timestamp rather than by a single
                 # step, so a low baseline_fps on a long video cannot drift.
                 while next_baseline_ts <= timestamp:
