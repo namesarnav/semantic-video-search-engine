@@ -13,6 +13,7 @@ DATA_DIR = Path(os.environ.get("SV_DATA_DIR", "data")).resolve()
 VIDEO_DIR = DATA_DIR / "videos"
 THUMBNAIL_DIR = DATA_DIR / "thumbnails"
 INDEX_DIR = DATA_DIR / "index"
+DB_PATH = DATA_DIR / "sv_engine.sqlite"
 
 # CLIP checkpoint. ViT-B-32 is the fast/cheap baseline; ViT-L-14 is slower but
 # better. Benchmark against Recall@K before switching (see CLAUDE.md).
