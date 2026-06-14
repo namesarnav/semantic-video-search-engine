@@ -1,22 +1,19 @@
-"""FAISS index plus its sidecar metadata.
+"""FAISS vector index.
 
-FAISS stores vectors and nothing else. Everything needed to turn a hit back into
-a human-meaningful result -- which video, which timestamp, which thumbnail --
-lives alongside it, keyed by the vector's position in the index.
+This module stores vectors and nothing else. The mapping from a vector back to
+a video and timestamp lives in SQLite (see db.py), joined on the vector's
+position in this index.
 
-Keeping those two in sync is the sharpest failure mode in this system: a
-mismatch does not crash, it silently returns the wrong timestamp. So the index
-and its metadata are always written together, and loading validates that their
-lengths agree.
-
-M1 uses a JSON sidecar. M2 replaces it with SQLite; the FrameRecord shape is
-already the target row.
+A vector's position is assigned implicitly by FAISS: the first vector added is
+0, the next is 1, and so on. Nothing here may ever reorder or remove a vector,
+because every id after it would shift and every stored ``vector_index_id`` in
+the database would then point at the wrong frame. Removal is done by rebuilding
+both together.
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import faiss
@@ -25,107 +22,94 @@ import numpy as np
 from . import config
 
 _INDEX_FILENAME = "frames.faiss"
-_META_FILENAME = "frames.json"
 
 
 @dataclass(frozen=True)
-class FrameRecord:
-    """Metadata for one indexed frame. Mirrors the future `frames` table."""
+class VectorHit:
+    """A raw FAISS result: a position and its similarity score."""
 
-    video_id: str
-    filename: str
-    timestamp_sec: float
-    thumbnail_path: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class SearchHit:
+    vector_index_id: int
     score: float
-    record: FrameRecord
 
 
-class FrameIndex:
-    """A flat inner-product FAISS index over L2-normalized vectors.
+class VectorIndex:
+    """A flat inner-product index over L2-normalized vectors.
 
-    Flat means exact search. At this corpus size that is the right call -- an
-    approximate index (IVF/HNSW) trades recall for speed the system does not yet
-    need. Switch only when a measured p95 says so.
+    Flat means exact, exhaustive search. At this corpus size that is the right
+    call -- an approximate index (IVF/HNSW) trades recall for speed the system
+    does not yet need. Switch only when a measured p95 says so.
+
+    Inner product equals cosine similarity *only because* vectors are
+    normalized by the embedder before they arrive here.
     """
 
     def __init__(self, dim: int) -> None:
         self.dim = dim
         self.index = faiss.IndexFlatIP(dim)
-        self.records: list[FrameRecord] = []
 
     def __len__(self) -> int:
-        return len(self.records)
+        return int(self.index.ntotal)
 
-    def add(self, vectors: np.ndarray, records: list[FrameRecord]) -> None:
-        if len(vectors) != len(records):
-            raise ValueError(
-                f"vector/record count mismatch: {len(vectors)} vs {len(records)}"
-            )
-        if len(vectors) == 0:
-            return
+    def add(self, vectors: np.ndarray) -> list[int]:
+        """Append vectors and return the positions they were assigned."""
+        if vectors.ndim != 2:
+            raise ValueError(f"expected a 2-D array, got shape {vectors.shape}")
         if vectors.shape[1] != self.dim:
             raise ValueError(f"expected dim {self.dim}, got {vectors.shape[1]}")
-        self.index.add(np.ascontiguousarray(vectors, dtype=np.float32))
-        self.records.extend(records)
+        if len(vectors) == 0:
+            return []
 
-    def search(self, query: np.ndarray, top_k: int = 10) -> list[SearchHit]:
-        """Search with a single (dim,) or (1, dim) normalized query vector."""
+        first = len(self)
+        self.index.add(np.ascontiguousarray(vectors, dtype=np.float32))
+        return list(range(first, first + len(vectors)))
+
+    def next_vector_id(self) -> int:
+        return len(self)
+
+    def search(self, query: np.ndarray, top_k: int = 10) -> list[VectorHit]:
+        """Search with one normalized query vector, shaped (dim,) or (1, dim)."""
         if top_k <= 0:
             raise ValueError("top_k must be positive")
         if len(self) == 0:
             return []
 
         query = np.ascontiguousarray(query.reshape(1, -1), dtype=np.float32)
+        if query.shape[1] != self.dim:
+            raise ValueError(f"expected dim {self.dim}, got {query.shape[1]}")
+
         scores, ids = self.index.search(query, min(top_k, len(self)))
+        # FAISS pads with -1 when it has fewer results than requested.
+        return [
+            VectorHit(vector_index_id=int(i), score=float(s))
+            for s, i in zip(scores[0], ids[0])
+            if i >= 0
+        ]
 
-        hits: list[SearchHit] = []
-        for score, idx in zip(scores[0], ids[0]):
-            # FAISS pads with -1 when it has fewer results than requested.
-            if idx < 0:
-                continue
-            hits.append(SearchHit(score=float(score), record=self.records[idx]))
-        return hits
+    # ---- persistence --------------------------------------------------
 
-    def video_ids(self) -> set[str]:
-        return {r.video_id for r in self.records}
+    @staticmethod
+    def _path(directory: Path | str) -> Path:
+        return Path(directory) / _INDEX_FILENAME
 
     def save(self, directory: Path | str = config.INDEX_DIR) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self.index, str(directory / _INDEX_FILENAME))
-        payload = {
-            "dim": self.dim,
-            "records": [asdict(r) for r in self.records],
-        }
-        (directory / _META_FILENAME).write_text(json.dumps(payload, indent=2))
+        faiss.write_index(self.index, str(self._path(directory)))
 
     @classmethod
-    def load(cls, directory: Path | str = config.INDEX_DIR) -> "FrameIndex":
-        directory = Path(directory)
-        index_path = directory / _INDEX_FILENAME
-        meta_path = directory / _META_FILENAME
-        if not index_path.exists() or not meta_path.exists():
-            raise FileNotFoundError(f"no index found in {directory}")
-
-        payload = json.loads(meta_path.read_text())
-        instance = cls(dim=payload["dim"])
-        instance.index = faiss.read_index(str(index_path))
-        instance.records = [FrameRecord(**r) for r in payload["records"]]
-
-        if instance.index.ntotal != len(instance.records):
-            raise ValueError(
-                "index/metadata are out of sync: "
-                f"{instance.index.ntotal} vectors vs {len(instance.records)} records"
-            )
+    def load(cls, directory: Path | str = config.INDEX_DIR) -> "VectorIndex":
+        path = cls._path(directory)
+        if not path.exists():
+            raise FileNotFoundError(f"no index found at {path}")
+        raw = faiss.read_index(str(path))
+        instance = cls(dim=raw.d)
+        instance.index = raw
         return instance
 
     @classmethod
-    def load_or_create(cls, dim: int, directory: Path | str = config.INDEX_DIR) -> "FrameIndex":
+    def load_or_create(
+        cls, dim: int, directory: Path | str = config.INDEX_DIR
+    ) -> "VectorIndex":
         try:
             existing = cls.load(directory)
         except FileNotFoundError:
