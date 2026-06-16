@@ -1,20 +1,24 @@
-"""M1 command line: index a folder of videos, then query it.
+"""M2 command line: index a folder of videos, list them, then query.
 
     uv run python -m sv_engine.cli index data/videos
+    uv run python -m sv_engine.cli videos
     uv run python -m sv_engine.cli search "a red car at night"
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
 
-from . import config
+from . import config, db
+from .db import Database
 from .embedder import get_embedder
-from .index import FrameIndex
+from .index import VectorIndex
 from .ingest import ingest_video
+from .search import search
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
@@ -23,6 +27,20 @@ def _collect_videos(target: Path) -> list[Path]:
     if target.is_file():
         return [target]
     return sorted(p for p in target.iterdir() if p.suffix.lower() in VIDEO_SUFFIXES)
+
+
+def _reset_store() -> None:
+    """Drop index, database and thumbnails together.
+
+    All three or none: a rebuilt index with a stale database is exactly the
+    desync that produces confident wrong answers.
+    """
+    for path in (config.DB_PATH, config.INDEX_DIR / "frames.faiss"):
+        path.unlink(missing_ok=True)
+    for suffix in ("-wal", "-shm"):
+        Path(str(config.DB_PATH) + suffix).unlink(missing_ok=True)
+    if config.THUMBNAIL_DIR.exists():
+        shutil.rmtree(config.THUMBNAIL_DIR)
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -36,73 +54,124 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"error: no video files found in {target}", file=sys.stderr)
         return 1
 
+    if args.rebuild:
+        _reset_store()
     config.ensure_dirs()
+
     embedder = get_embedder()
     print(f"device={embedder.device} model={embedder.model_name}/{embedder.pretrained}")
 
-    index = (
-        FrameIndex(dim=embedder.dim)
-        if args.rebuild
-        else FrameIndex.load_or_create(dim=embedder.dim)
-    )
+    index = VectorIndex.load_or_create(dim=embedder.dim)
+    with Database() as database:
+        if not args.rebuild:
+            database.check_consistency(len(index))
 
-    started = time.perf_counter()
-    total_frames = 0
-    for video in videos:
-        video_started = time.perf_counter()
-        result = ingest_video(
-            video,
-            index,
-            embedder,
-            scene_threshold=None if args.fixed_interval else config.SCENE_THRESHOLD,
-            baseline_fps=args.baseline_fps,
-            skip_if_present=not args.rebuild,
-        )
-        if result.skipped:
-            print(f"  skip  {result.filename}  (already indexed as {result.video_id})")
-            continue
-        total_frames += result.frames_indexed
+        started = time.perf_counter()
+        total_frames = 0
+        failures = 0
+
+        for video in videos:
+            video_started = time.perf_counter()
+            try:
+                result = ingest_video(
+                    video,
+                    index,
+                    database,
+                    embedder,
+                    scene_threshold=None if args.fixed_interval else config.SCENE_THRESHOLD,
+                    baseline_fps=args.baseline_fps,
+                    force=args.rebuild or args.force,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep going, report at end
+                failures += 1
+                print(f"  FAIL  {video.name}  {exc}", file=sys.stderr)
+                continue
+
+            if result.skipped:
+                print(f"  skip  {result.filename}  (already indexed as {result.video_id})")
+                continue
+            total_frames += result.frames_indexed
+            print(
+                f"  ok    {result.filename}  "
+                f"{result.frames_indexed} frames  "
+                f"{result.duration_sec:.1f}s  "
+                f"[{time.perf_counter() - video_started:.1f}s]"
+            )
+
+        index.save()
+        database.check_consistency(len(index))
         print(
-            f"  ok    {result.filename}  "
-            f"{result.frames_indexed} frames  "
-            f"{result.duration_sec:.1f}s  "
-            f"[{time.perf_counter() - video_started:.1f}s]"
+            f"\nindexed {total_frames} new frames "
+            f"({len(index)} total, {len(database.list_videos(status=db.DONE))} videos) "
+            f"in {time.perf_counter() - started:.1f}s"
         )
+        if failures:
+            print(f"{failures} video(s) failed -- see `videos` for status", file=sys.stderr)
+            return 1
+    return 0
 
-    index.save()
-    print(
-        f"\nindexed {total_frames} new frames "
-        f"({len(index)} total, {len(index.video_ids())} videos) "
-        f"in {time.perf_counter() - started:.1f}s"
-    )
+
+def cmd_videos(args: argparse.Namespace) -> int:
+    with Database() as database:
+        rows = database.list_videos(status=args.status)
+        if not rows:
+            print("no videos ingested")
+            return 0
+        print(f"{'STATUS':<11}{'ID':<18}{'FRAMES':>7}  {'DURATION':>9}  FILENAME")
+        for row in rows:
+            frames = len(
+                [
+                    f
+                    for f in database.conn.execute(
+                        "SELECT 1 FROM frames WHERE video_id = ?", (row.id,)
+                    ).fetchall()
+                ]
+            )
+            print(
+                f"{row.status:<11}{row.id:<18}{frames:>7}  "
+                f"{row.duration_sec:>8.1f}s  {row.filename}"
+            )
+            if row.error:
+                print(f"{'':<11}error: {row.error}")
     return 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
     try:
-        index = FrameIndex.load()
+        index = VectorIndex.load()
     except FileNotFoundError:
         print("error: no index found -- run `index` first", file=sys.stderr)
         return 1
 
-    embedder = get_embedder()
-    started = time.perf_counter()
-    vector = embedder.encode_text([args.query])[0]
-    hits = index.search(vector, top_k=args.top_k)
-    elapsed_ms = (time.perf_counter() - started) * 1000
+    with Database() as database:
+        database.check_consistency(len(index))
+        embedder = get_embedder()
+        started = time.perf_counter()
+        try:
+            results = search(
+                args.query,
+                index,
+                database,
+                embedder,
+                top_k=args.top_k,
+                collapse_window_sec=args.collapse,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        elapsed_ms = (time.perf_counter() - started) * 1000
 
-    if not hits:
-        print("no results")
-        return 0
+        if not results:
+            print("no results")
+            return 0
 
-    print(f'\n"{args.query}"  ({elapsed_ms:.0f}ms, {len(index)} frames searched)\n')
-    for rank, hit in enumerate(hits, start=1):
-        r = hit.record
-        print(
-            f"{rank:>2}. {hit.score:.4f}  {r.filename}  "
-            f"@ {r.timestamp_sec:6.2f}s  [{r.reason}]"
-        )
-        print(f"      {r.thumbnail_path}")
+        print(f'\n"{args.query}"  ({elapsed_ms:.0f}ms, {len(index)} frames searched)\n')
+        for rank, r in enumerate(results, start=1):
+            print(
+                f"{rank:>2}. {r.score:.4f}  {r.filename}  "
+                f"@ {r.timestamp_sec:6.2f}s  [{r.reason}]"
+            )
+            print(f"      {r.thumbnail_path}")
     return 0
 
 
@@ -113,7 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_index = sub.add_parser("index", help="ingest a video file or folder")
     p_index.add_argument("target", help="video file or directory of videos")
     p_index.add_argument(
-        "--rebuild", action="store_true", help="discard the existing index first"
+        "--rebuild",
+        action="store_true",
+        help="discard index, database and thumbnails, then re-ingest everything",
+    )
+    p_index.add_argument(
+        "--force", action="store_true", help="re-ingest videos already marked done"
     )
     p_index.add_argument(
         "--fixed-interval",
@@ -123,9 +197,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--baseline-fps", type=float, default=config.BASELINE_FPS)
     p_index.set_defaults(func=cmd_index)
 
+    p_videos = sub.add_parser("videos", help="list ingested videos and their status")
+    p_videos.add_argument(
+        "--status", choices=sorted(db.VALID_STATUSES), help="filter by status"
+    )
+    p_videos.set_defaults(func=cmd_videos)
+
     p_search = sub.add_parser("search", help="query the index")
     p_search.add_argument("query", help="natural-language query")
     p_search.add_argument("-k", "--top-k", type=int, default=10)
+    p_search.add_argument(
+        "--collapse",
+        type=float,
+        metavar="SEC",
+        help="merge hits from the same video within SEC seconds of each other",
+    )
     p_search.set_defaults(func=cmd_search)
 
     return parser
