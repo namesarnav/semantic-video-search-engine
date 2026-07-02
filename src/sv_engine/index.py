@@ -13,6 +13,7 @@ both together.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,12 @@ class VectorIndex:
     def __init__(self, dim: int) -> None:
         self.dim = dim
         self.index = faiss.IndexFlatIP(dim)
+        # FAISS is not safe for a concurrent add and search. The lock lives
+        # here rather than in callers so it cannot be forgotten, and it is held
+        # only for the microseconds of the FAISS call itself -- never around
+        # sampling or embedding, which would freeze search for the whole of a
+        # 20-second ingest.
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return int(self.index.ntotal)
@@ -59,9 +66,10 @@ class VectorIndex:
         if len(vectors) == 0:
             return []
 
-        first = len(self)
-        self.index.add(np.ascontiguousarray(vectors, dtype=np.float32))
-        return list(range(first, first + len(vectors)))
+        with self._lock:
+            first = len(self)
+            self.index.add(np.ascontiguousarray(vectors, dtype=np.float32))
+            return list(range(first, first + len(vectors)))
 
     def next_vector_id(self) -> int:
         return len(self)
@@ -77,7 +85,8 @@ class VectorIndex:
         if query.shape[1] != self.dim:
             raise ValueError(f"expected dim {self.dim}, got {query.shape[1]}")
 
-        scores, ids = self.index.search(query, min(top_k, len(self)))
+        with self._lock:
+            scores, ids = self.index.search(query, min(top_k, len(self)))
         # FAISS pads with -1 when it has fewer results than requested.
         return [
             VectorHit(vector_index_id=int(i), score=float(s))
@@ -94,7 +103,8 @@ class VectorIndex:
     def save(self, directory: Path | str = config.INDEX_DIR) -> None:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self.index, str(self._path(directory)))
+        with self._lock:
+            faiss.write_index(self.index, str(self._path(directory)))
 
     @classmethod
     def load(cls, directory: Path | str = config.INDEX_DIR) -> "VectorIndex":

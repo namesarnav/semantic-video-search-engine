@@ -111,3 +111,71 @@ def test_load_or_create_rejects_a_dimension_change(populated, tmp_path):
     populated.save(tmp_path)
     with pytest.raises(ValueError, match="rebuild"):
         VectorIndex.load_or_create(dim=512, directory=tmp_path)
+
+
+def test_concurrent_adds_assign_unique_positions():
+    """The race the internal lock exists to prevent.
+
+    ``add`` reads the current length, then appends. Without a lock two threads
+    can read the same length and both claim the same position, producing
+    duplicate vector ids -- the desync that makes search return the wrong
+    timestamp with no error anywhere.
+    """
+    import threading
+
+    index = VectorIndex(dim=3)
+    assigned: list[int] = []
+    guard = threading.Lock()
+
+    def worker() -> None:
+        for _ in range(20):
+            ids = index.add(_unit([1.0, 0.0, 0.0]))
+            with guard:
+                assigned.extend(ids)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(assigned) == 160
+    assert len(set(assigned)) == 160, "duplicate positions were handed out"
+    assert sorted(assigned) == list(range(160))
+    assert len(index) == 160
+
+
+def test_search_during_concurrent_adds_does_not_error():
+    """Searching while another thread writes must not crash or return junk."""
+    import threading
+
+    index = VectorIndex(dim=3)
+    index.add(_unit([1.0, 0.0, 0.0]))
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        try:
+            for _ in range(100):
+                index.add(_unit([0.0, 1.0, 0.0]))
+        except Exception as exc:  # noqa: BLE001 - recorded and re-raised below
+            errors.append(exc)
+        finally:
+            stop.set()
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                for hit in index.search(_unit([1.0, 0.0, 0.0])[0], top_k=3):
+                    assert hit.vector_index_id >= 0
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent access raised: {errors}"
+    assert len(index) == 101
