@@ -48,14 +48,17 @@ class IngestResult:
     error: str | None = None
 
 
-def _write_thumbnail(frame, video_id: str, timestamp_sec: float) -> Path:
-    config.THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+def _write_thumbnail(
+    frame, video_id: str, timestamp_sec: float, thumbnail_dir: Path | None = None
+) -> Path:
+    directory = Path(thumbnail_dir) if thumbnail_dir else config.THUMBNAIL_DIR
+    directory.mkdir(parents=True, exist_ok=True)
     height = max(1, int(frame.shape[0] * (config.THUMBNAIL_WIDTH / frame.shape[1])))
     small = cv2.resize(
         frame, (config.THUMBNAIL_WIDTH, height), interpolation=cv2.INTER_AREA
     )
     # Milliseconds in the name so two samples in the same second cannot collide.
-    path = config.THUMBNAIL_DIR / f"{video_id}_{int(timestamp_sec * 1000):09d}.jpg"
+    path = directory / f"{video_id}_{int(timestamp_sec * 1000):09d}.jpg"
     cv2.imwrite(str(path), small, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return path
 
@@ -69,6 +72,7 @@ def ingest_video(
     scene_threshold: float | None = config.SCENE_THRESHOLD,
     baseline_fps: float = config.BASELINE_FPS,
     force: bool = False,
+    thumbnail_dir: Path | None = None,
 ) -> IngestResult:
     """Sample, embed and index one video. Mutates ``index`` and ``database``.
 
@@ -121,7 +125,8 @@ def ingest_video(
         # Embed everything before writing anything.
         vectors = embedder.encode_images([f.image for f in frames])
         thumbnails = [
-            str(_write_thumbnail(f.image, video_id, f.timestamp_sec)) for f in frames
+            str(_write_thumbnail(f.image, video_id, f.timestamp_sec, thumbnail_dir))
+            for f in frames
         ]
 
         vector_ids = index.add(vectors)

@@ -215,8 +215,28 @@ class Database:
         ).fetchall()
         return {r["vector_index_id"]: FrameRow(**dict(r)) for r in rows}
 
-    def frame_count(self) -> int:
-        return int(self.conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0])
+    def get_frame(self, frame_id: int) -> FrameRow | None:
+        """Fetch one frame by primary key, for serving its thumbnail."""
+        row = self.conn.execute(
+            """
+            SELECT f.*, v.filename
+            FROM frames f
+            JOIN videos v ON v.id = f.video_id
+            WHERE f.id = ?
+            """,
+            (frame_id,),
+        ).fetchone()
+        return FrameRow(**dict(row)) if row else None
+
+    def frame_count(self, video_id: str | None = None) -> int:
+        """Frames across the corpus, or for one video when given an id."""
+        if video_id is None:
+            return int(self.conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0])
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM frames WHERE video_id = ?", (video_id,)
+            ).fetchone()[0]
+        )
 
     def max_vector_id(self) -> int:
         """Highest assigned FAISS position, or -1 when empty."""
