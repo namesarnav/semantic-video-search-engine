@@ -1,7 +1,8 @@
-"""M2 command line: index a folder of videos, list them, then query.
+"""Command line: index a folder of videos, inspect them, serve the API, query.
 
     uv run python -m sv_engine.cli index data/videos
     uv run python -m sv_engine.cli videos
+    uv run python -m sv_engine.cli serve --port 8000
     uv run python -m sv_engine.cli search "a red car at night"
 """
 
@@ -175,6 +176,22 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the HTTP API. A thin wrapper over uvicorn so the incantation lives
+    in one place; the app itself is built in api.py."""
+    import uvicorn
+
+    print(f"serving on http://{args.host}:{args.port}  (docs at /docs)")
+    uvicorn.run(
+        "sv_engine.api:create_default_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sv-engine", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -202,6 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--status", choices=sorted(db.VALID_STATUSES), help="filter by status"
     )
     p_videos.set_defaults(func=cmd_videos)
+
+    p_serve = sub.add_parser("serve", help="run the HTTP API")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument(
+        "--reload", action="store_true", help="restart on code changes (development)"
+    )
+    p_serve.set_defaults(func=cmd_serve)
 
     p_search = sub.add_parser("search", help="query the index")
     p_search.add_argument("query", help="natural-language query")
