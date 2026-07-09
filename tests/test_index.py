@@ -179,3 +179,108 @@ def test_search_during_concurrent_adds_does_not_error():
 
     assert not errors, f"concurrent access raised: {errors}"
     assert len(index) == 101
+
+
+# ---- truncation (M4 crash recovery) --------------------------------------
+
+
+def test_truncate_drops_the_tail_and_keeps_the_rest(populated):
+    """Recovery's only safe repair. Positions below the cut must not move --
+    every vector_index_id in the database depends on that."""
+    populated.truncate(2)
+
+    assert len(populated) == 2
+    hits = populated.search(_unit([0, 1, 0])[0], top_k=2)
+    assert hits[0].vector_index_id == 1
+    assert hits[0].score == pytest.approx(1.0, abs=1e-5)
+
+
+def test_truncate_to_zero_empties_the_index(populated):
+    populated.truncate(0)
+    assert len(populated) == 0
+    assert populated.search(_unit([1, 0, 0])[0], top_k=1) == []
+
+
+def test_truncate_to_current_size_is_a_noop(populated):
+    populated.truncate(3)
+    assert len(populated) == 3
+
+
+def test_truncate_cannot_grow_the_index(populated):
+    with pytest.raises(ValueError, match="grow"):
+        populated.truncate(5)
+
+
+def test_truncate_rejects_a_negative_size(populated):
+    with pytest.raises(ValueError):
+        populated.truncate(-1)
+
+
+def test_new_positions_continue_after_a_truncation(populated):
+    """After a repair the next ingest must not reuse a discarded position as
+    if it were fresh -- it may, but only because nothing references it."""
+    populated.truncate(1)
+    assert populated.add(_unit([0, 1, 0])) == [1]
+    assert len(populated) == 2
+
+
+def test_save_leaves_no_partial_file_behind(populated, tmp_path):
+    """The write is atomic: a crash mid-save must leave the previous index
+    intact rather than a truncated file that will not load."""
+    populated.save(tmp_path)
+    assert list(tmp_path.glob("*.tmp*")) == []
+    assert len(VectorIndex.load(tmp_path)) == 3
+
+
+def test_appending_serializes_writers():
+    """The append lock is what makes 'orphan vectors are always the tail' true.
+
+    It is deliberately coarser than the FAISS lock -- a writer holds it across
+    add, persist and commit -- but it blocks only other *writers*. Searches are
+    never held up by it.
+    """
+    import threading
+
+    index = VectorIndex(dim=3)
+    order: list[str] = []
+    first_inside = threading.Event()
+    release = threading.Event()
+
+    def slow_writer() -> None:
+        with index.appending():
+            order.append("a-in")
+            first_inside.set()
+            release.wait(timeout=2)
+            order.append("a-out")
+
+    def second_writer() -> None:
+        first_inside.wait(timeout=2)
+        release.set()
+        with index.appending():
+            order.append("b-in")
+
+    threads = [threading.Thread(target=slow_writer), threading.Thread(target=second_writer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert order == ["a-in", "a-out", "b-in"]
+
+
+def test_search_is_not_blocked_by_an_open_append(populated):
+    """CLAUDE.md's rule 2, restated as a test: holding the writer lock across a
+    long ingest must not freeze search."""
+    import threading
+
+    done = threading.Event()
+
+    def searcher() -> None:
+        populated.search(_unit([1, 0, 0])[0], top_k=1)
+        done.set()
+
+    with populated.appending():
+        thread = threading.Thread(target=searcher)
+        thread.start()
+        assert done.wait(timeout=2), "search blocked while a writer held the lock"
+        thread.join()

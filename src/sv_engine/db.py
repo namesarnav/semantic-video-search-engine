@@ -172,12 +172,23 @@ class Database:
 
     # ---- frames -------------------------------------------------------
 
-    def add_frames(self, video_id: str, frames: Sequence[dict]) -> None:
+    def add_frames(
+        self, video_id: str, frames: Sequence[dict], *, status: str | None = None
+    ) -> None:
         """Insert a video's frames in a single transaction.
 
         Called only after the vectors are computed, so a failure during
         embedding leaves no half-written rows.
+
+        ``status`` is applied inside that same transaction. Ingestion passes
+        ``done``, which closes the window a separate ``set_status`` would leave
+        open: a crash between the two commits would leave a complete set of
+        frames on a video still marked ``processing``, and recovery -- unable
+        to tell that from a half-written one -- would re-ingest it and double
+        every frame.
         """
+        if status is not None and status not in VALID_STATUSES:
+            raise ValueError(f"unknown status: {status!r}")
         with self.conn:  # commits on success, rolls back on exception
             self.conn.executemany(
                 """
@@ -196,6 +207,41 @@ class Database:
                     for f in frames
                 ],
             )
+            if status is not None:
+                self.conn.execute(
+                    "UPDATE videos SET status = ?, error = NULL, ingested_at = ? "
+                    "WHERE id = ?",
+                    (status, _utc_now() if status == DONE else None, video_id),
+                )
+
+    def delete_frames(self, video_id: str) -> int:
+        """Drop one video's frames while keeping the video row.
+
+        Used by crash recovery: a video whose vectors did not survive is failed
+        wholesale rather than left half-searchable, but the row must stay so the
+        failure is visible and the file can be re-ingested.
+        """
+        with self.conn:
+            cursor = self.conn.execute(
+                "DELETE FROM frames WHERE video_id = ?", (video_id,)
+            )
+        return cursor.rowcount
+
+    def video_ids_with_vectors_at_or_above(self, threshold: int) -> list[str]:
+        """Videos owning a frame whose vector is past the end of the index.
+
+        After a crash the index can be shorter than the metadata; every video
+        listed here is missing at least one vector and cannot be trusted.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT video_id FROM frames
+            WHERE vector_index_id >= ?
+            ORDER BY video_id
+            """,
+            (threshold,),
+        ).fetchall()
+        return [r["video_id"] for r in rows]
 
     def frames_by_vector_ids(self, vector_ids: Iterable[int]) -> dict[int, FrameRow]:
         """Look up frames by FAISS position. Keyed by vector_index_id so the
@@ -252,11 +298,12 @@ class Database:
             raise ValueError(
                 "database and vector index are out of sync: "
                 f"{count} frame rows vs {index_size} vectors. "
-                "Re-ingest with --rebuild."
+                "Run `sv-engine recover`, or re-ingest with --rebuild."
             )
         highest = self.max_vector_id()
         if count and highest != count - 1:
             raise ValueError(
                 "vector ids are not contiguous: "
-                f"{count} rows but highest id is {highest}. Re-ingest with --rebuild."
+                f"{count} rows but highest id is {highest}. "
+                "Run `sv-engine recover`, or re-ingest with --rebuild."
             )

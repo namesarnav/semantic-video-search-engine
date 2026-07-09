@@ -5,6 +5,15 @@ before anything is written, so a failure part-way through leaves no vectors in
 the index and no rows in the database. That gives atomicity at video
 granularity, which a flat FAISS index cannot otherwise provide -- it has no way
 to remove vectors without shifting every id after them.
+
+The write itself is ordered for the benefit of crash recovery (M4). Under
+``index.appending`` -- so no other ingest can interleave its vectors -- the
+index is persisted *first*, and only then are the rows and the ``done`` status
+committed in one transaction. Every crash window therefore leaves at most a run
+of surplus vectors at the tail of the index, which ``recovery.reconcile`` can
+drop without moving a single surviving ``vector_index_id``. The opposite order
+would lose vectors the database still points at, which nothing short of
+re-embedding can repair.
 """
 
 from __future__ import annotations
@@ -72,12 +81,18 @@ def ingest_video(
     scene_threshold: float | None = config.SCENE_THRESHOLD,
     baseline_fps: float = config.BASELINE_FPS,
     force: bool = False,
+    index_dir: Path | None = None,
     thumbnail_dir: Path | None = None,
 ) -> IngestResult:
     """Sample, embed and index one video. Mutates ``index`` and ``database``.
 
     Re-ingesting an already-``done`` video is a no-op unless ``force`` is set
-    (FR5). A video left in ``processing`` by an earlier crash is retried.
+    (FR5). A video left in ``processing`` by an earlier crash is retried; see
+    ``recovery.py`` for how such a video is swept to ``failed`` at startup.
+
+    Passing ``index_dir`` makes each video durable as it completes, rather than
+    only when the caller eventually saves. Both front ends do so: an unsaved
+    index is lost on restart even though the database says ``done``.
     """
     path = Path(path)
     if not path.exists():
@@ -95,6 +110,18 @@ def ingest_video(
             frames_indexed=0,
             status=db.DONE,
             skipped=True,
+        )
+
+    if existing is not None and database.frame_count(video_id) > 0:
+        # `force` bypasses the skip above, but the previous run's frames are
+        # still indexed and their vectors sit in the middle of a flat index,
+        # where they cannot be removed without shifting every id after them.
+        # Adding a second set would silently double every hit for this video,
+        # so refuse and point at the one operation that is safe.
+        raise ValueError(
+            f"{path.name} already has {database.frame_count(video_id)} indexed "
+            "frames; re-ingesting would duplicate them. Use --rebuild to drop "
+            "the index, database and thumbnails together and start over."
         )
 
     # Register the video before anything that can fail. Probing a corrupt file
@@ -122,27 +149,43 @@ def ingest_video(
                 video_id, path.name, duration, 0, db.FAILED, error="no frames sampled"
             )
 
-        # Embed everything before writing anything.
+        # Embed everything before writing anything. Deliberately outside the
+        # append lock below: embedding is the slow part, and holding a lock
+        # across it would make one ingest block every other.
         vectors = embedder.encode_images([f.image for f in frames])
         thumbnails = [
             str(_write_thumbnail(f.image, video_id, f.timestamp_sec, thumbnail_dir))
             for f in frames
         ]
 
-        vector_ids = index.add(vectors)
-        database.add_frames(
-            video_id,
-            [
-                {
-                    "timestamp_sec": f.timestamp_sec,
-                    "thumbnail_path": thumb,
-                    "reason": f.reason,
-                    "vector_index_id": vid,
-                }
-                for f, thumb, vid in zip(frames, thumbnails, vector_ids)
-            ],
-        )
-        database.set_status(video_id, db.DONE)
+        with index.appending():
+            before = len(index)
+            vector_ids = index.add(vectors)
+            try:
+                if index_dir is not None:
+                    index.save(index_dir)
+                database.add_frames(
+                    video_id,
+                    [
+                        {
+                            "timestamp_sec": f.timestamp_sec,
+                            "thumbnail_path": thumb,
+                            "reason": f.reason,
+                            "vector_index_id": vid,
+                        }
+                        for f, thumb, vid in zip(frames, thumbnails, vector_ids)
+                    ],
+                    status=db.DONE,
+                )
+            except Exception:
+                # Roll the in-memory index back to where it started. The lock
+                # guarantees these vectors are still the tail, so dropping them
+                # is exact -- and leaving them would strand vectors no row
+                # points at, which reports the whole store as out of sync.
+                index.truncate(before)
+                if index_dir is not None:
+                    index.save(index_dir)
+                raise
 
         return IngestResult(
             video_id=video_id,
