@@ -2,6 +2,7 @@
 
     uv run python -m sv_engine.cli index data/videos
     uv run python -m sv_engine.cli videos
+    uv run python -m sv_engine.cli recover
     uv run python -m sv_engine.cli serve --port 8000
     uv run python -m sv_engine.cli search "a red car at night"
 """
@@ -14,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import config, db
+from . import config, db, recovery
 from .db import Database
 from .embedder import get_embedder
 from .index import VectorIndex
@@ -62,10 +63,14 @@ def cmd_index(args: argparse.Namespace) -> int:
     embedder = get_embedder()
     print(f"device={embedder.device} model={embedder.model_name}/{embedder.pretrained}")
 
-    index = VectorIndex.load_or_create(dim=embedder.dim)
+    index = VectorIndex.load_or_create(dim=embedder.dim, directory=config.INDEX_DIR)
     with Database() as database:
         if not args.rebuild:
-            database.check_consistency(len(index))
+            # Repair whatever the last run left behind before adding to it.
+            # --rebuild skips this: the store was just deleted.
+            report = recovery.recover(index, database, index_dir=config.INDEX_DIR)
+            if not report.clean:
+                print(report.describe())
 
         started = time.perf_counter()
         total_frames = 0
@@ -82,6 +87,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                     scene_threshold=None if args.fixed_interval else config.SCENE_THRESHOLD,
                     baseline_fps=args.baseline_fps,
                     force=args.rebuild or args.force,
+                    index_dir=config.INDEX_DIR,
                 )
             except Exception as exc:  # noqa: BLE001 - keep going, report at end
                 failures += 1
@@ -99,7 +105,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 f"[{time.perf_counter() - video_started:.1f}s]"
             )
 
-        index.save()
+        index.save(config.INDEX_DIR)
         database.check_consistency(len(index))
         print(
             f"\nindexed {total_frames} new frames "
@@ -137,9 +143,45 @@ def cmd_videos(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recover(args: argparse.Namespace) -> int:
+    """Repair a store left inconsistent by a crash.
+
+    Runs automatically before `index` and at API startup; exposed as a command
+    so a store can be inspected and repaired without ingesting anything.
+    """
+    with Database() as database:
+        try:
+            index = VectorIndex.load(config.INDEX_DIR)
+        except FileNotFoundError:
+            if database.frame_count():
+                print(
+                    f"error: {database.frame_count()} frame rows but no index file. "
+                    "Every vector is gone, which no repair can undo -- re-ingest "
+                    "with --rebuild.",
+                    file=sys.stderr,
+                )
+                return 1
+            # Nothing indexed yet: a crash during the very first ingest.
+            swept = recovery.sweep_interrupted(database)
+            print(
+                f"recovered: {len(swept)} interrupted video(s) marked failed"
+                if swept
+                else "store is consistent; nothing to recover"
+            )
+            return 0
+
+        report = recovery.recover(index, database, index_dir=config.INDEX_DIR)
+        print(report.describe())
+        for video_id in report.swept:
+            print(f"  failed  {video_id}  (interrupted -- re-ingest to retry)")
+        for video_id in report.dropped_videos:
+            print(f"  failed  {video_id}  (vectors lost -- re-ingest to retry)")
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     try:
-        index = VectorIndex.load()
+        index = VectorIndex.load(config.INDEX_DIR)
     except FileNotFoundError:
         print("error: no index found -- run `index` first", file=sys.stderr)
         return 1
@@ -227,6 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reload", action="store_true", help="restart on code changes (development)"
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    p_recover = sub.add_parser(
+        "recover", help="repair a store left inconsistent by a crash"
+    )
+    p_recover.set_defaults(func=cmd_recover)
 
     p_search = sub.add_parser("search", help="query the index")
     p_search.add_argument("query", help="natural-language query")

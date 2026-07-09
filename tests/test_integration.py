@@ -142,3 +142,65 @@ def test_cross_video_search_maps_back_correctly(store, synthetic_video):
     row = database.get_video(top.video_id)
     assert top.filename == row.filename
     assert 0.0 <= top.timestamp_sec <= 4.0
+
+
+# ---- crash recovery (M4) --------------------------------------------------
+
+
+def test_a_killed_ingest_is_swept_to_failed(tmp_path, synthetic_video):
+    """The real thing, not a simulation: SIGKILL a running ingest.
+
+    No ``except`` block runs, so the video stays ``processing`` -- which is the
+    state M4 exists to clean up. Recovery must turn it into a visible
+    ``failed`` and leave the store consistent enough to search.
+    """
+    import os
+    import signal
+    import subprocess
+    import time as clock
+
+    from sv_engine import recovery
+    from sv_engine.index import VectorIndex
+
+    data_dir = tmp_path / "data"
+    videos = data_dir / "videos"
+    videos.mkdir(parents=True)
+    source = synthetic_video(duration_sec=45.0, cut_at_sec=[10.0, 20.0, 30.0])
+    source.replace(videos / source.name)
+
+    env = {**os.environ, "SV_DATA_DIR": str(data_dir)}
+    proc = subprocess.Popen(
+        ["uv", "run", "python", "-m", "sv_engine.cli", "index", str(videos)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        db_path = data_dir / "sv_engine.sqlite"
+        deadline = clock.monotonic() + 180
+        while clock.monotonic() < deadline:
+            if db_path.exists():
+                with Database(db_path) as database:
+                    if database.list_videos(status=db.PROCESSING):
+                        break
+            if proc.poll() is not None:
+                raise AssertionError("ingest exited before it could be killed")
+            clock.sleep(0.2)
+        else:
+            raise AssertionError("ingest never reached `processing`")
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=30)
+
+    with Database(db_path) as database:
+        # The damage: stuck mid-flight, with nothing to notice it by itself.
+        assert database.list_videos(status=db.PROCESSING)
+
+        index = VectorIndex.load_or_create(dim=512, directory=data_dir / "index")
+        report = recovery.recover(index, database, index_dir=data_dir / "index")
+
+        assert not report.clean
+        assert database.list_videos(status=db.PROCESSING) == []
+        assert len(database.list_videos(status=db.FAILED)) == 1
+        assert "interrupted" in database.list_videos(status=db.FAILED)[0].error
+        database.check_consistency(len(index))

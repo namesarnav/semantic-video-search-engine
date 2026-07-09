@@ -16,6 +16,11 @@ Two concurrency rules hold this together:
   can reach it is deliberately declared ``def``. Making them ``async def``
   would stall the whole server for the duration of an ingest.
 
+* **Recovery runs before the first request.** A restart is how a crash gets
+  noticed: the lifespan hook sweeps videos the previous process abandoned and
+  reconciles the index against the database, so the server never comes up
+  serving a store it will only reject at query time.
+
 SQLite connections cannot cross threads, so each request and task opens its own.
 """
 
@@ -25,16 +30,17 @@ import logging
 import shutil
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import config, db
+from . import config, db, recovery
 from .db import Database
 from .index import VectorIndex
 from .ingest import content_hash, ingest_video
@@ -80,7 +86,7 @@ def build_default_state() -> AppState:
 
     config.ensure_dirs()
     embedder = get_embedder()
-    index = VectorIndex.load_or_create(dim=embedder.dim)
+    index = VectorIndex.load_or_create(dim=embedder.dim, directory=config.INDEX_DIR)
     return AppState(
         embedder=embedder,
         index=index,
@@ -157,10 +163,24 @@ class SearchResponse(BaseModel):
 
 
 def create_app(state: AppState) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """Repair the store before accepting traffic (M4).
+
+        Safe on the event loop: nothing is being served yet, this touches no
+        CLIP, and it is bounded by the index size rather than by any video.
+        """
+        with state.open_db() as database:
+            report = recovery.recover(state.index, database, index_dir=state.index_dir)
+        if not report.clean:
+            logger.warning("startup recovery: %s", report.describe())
+        yield
+
     app = FastAPI(
         title="Semantic Video Search",
         description="Search video by what is happening in the frame.",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     # The M5 UI will be served from a different origin in development.
@@ -175,16 +195,18 @@ def create_app(state: AppState) -> FastAPI:
         """Background worker. Plain ``def`` so FastAPI runs it off the event loop."""
         with state.open_db() as database:
             try:
+                # index_dir makes the ingest persist its own vectors before
+                # committing rows: an unsaved index is lost on restart even
+                # though the database already says the video is done, and the
+                # ordering is what keeps a crash here repairable.
                 ingest_video(
                     path,
                     state.index,
                     database,
                     state.embedder,
+                    index_dir=state.index_dir,
                     thumbnail_dir=state.thumbnail_dir,
                 )
-                # Persist immediately: an unsaved index is lost on restart even
-                # though the database already says the video is done.
-                state.index.save(state.index_dir)
             except Exception as exc:  # noqa: BLE001
                 # ingest_video already recorded `failed` with the message; the
                 # job is finished either way, so do not re-raise into the task.
