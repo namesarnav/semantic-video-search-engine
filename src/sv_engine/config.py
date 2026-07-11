@@ -25,6 +25,13 @@ BASELINE_FPS = float(os.environ.get("SV_BASELINE_FPS", "1.0"))
 SCENE_THRESHOLD = float(os.environ.get("SV_SCENE_THRESHOLD", "0.35"))
 MIN_SAMPLE_GAP_SEC = float(os.environ.get("SV_MIN_SAMPLE_GAP", "0.4"))
 
+# The built React UI (M5). Anchored to the checkout rather than DATA_DIR: it is
+# code that ships with the repo, not data the user accumulates. Absent until
+# `npm run build` has run, which the API treats as "no UI", not as an error.
+WEB_DIST_DIR = Path(
+    os.environ.get("SV_WEB_DIST", Path(__file__).resolve().parents[2] / "web" / "dist")
+)
+
 EMBED_BATCH_SIZE = int(os.environ.get("SV_EMBED_BATCH", "32"))
 THUMBNAIL_WIDTH = int(os.environ.get("SV_THUMBNAIL_WIDTH", "384"))
 

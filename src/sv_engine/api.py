@@ -37,6 +37,7 @@ from typing import AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -71,6 +72,7 @@ class AppState:
     index_dir: Path
     thumbnail_dir: Path | None = None
     upload_dir: Path | None = None
+    web_dir: Path | None = None
 
     def open_db(self) -> Database:
         return Database(self.db_path)
@@ -92,6 +94,7 @@ def build_default_state() -> AppState:
         index=index,
         db_path=config.DB_PATH,
         index_dir=config.INDEX_DIR,
+        web_dir=config.WEB_DIST_DIR,
     )
 
 
@@ -362,6 +365,29 @@ def create_app(state: AppState) -> FastAPI:
                 "vectors": len(state.index),
                 "device": getattr(state.embedder, "device", "unknown"),
             }
+
+    # ---- the built UI ---------------------------------------------------
+    #
+    # Registered last, and only here. A mount at "/" matches every path, and
+    # Starlette resolves routes in registration order -- so anything declared
+    # after it would be unreachable, and anything before it (every route above,
+    # plus /docs) still wins. Moving this block up would leave a page that
+    # loads and whose every request 404s.
+    ui = Path(state.web_dir) if state.web_dir else None
+    if ui is not None and (ui / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=ui, html=True), name="ui")
+    else:
+
+        @app.get("/", include_in_schema=False)
+        def ui_not_built() -> None:
+            # The UI is optional -- a headless deployment is legitimate -- so
+            # this is a 404 rather than a startup failure, but it says what to
+            # run rather than leaving a bare Not Found.
+            raise HTTPException(
+                404,
+                "UI not built. Run `npm --prefix web install && npm --prefix web run "
+                "build`, or run the Vite dev server with `npm --prefix web run dev`.",
+            )
 
     return app
 
