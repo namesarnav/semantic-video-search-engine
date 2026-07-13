@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import time
 from pathlib import Path
 
-from . import config, db, recovery
+from . import config, db, evaluation, recovery
 from .db import Database
 from .embedder import get_embedder
 from .index import VectorIndex
@@ -218,6 +219,59 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Score the corpus against the hand-labelled eval set.
+
+    Reads the store as it stands -- it never re-ingests. The sampling A/B is
+    therefore two runs: build the store one way, `eval --json a.json`, rebuild
+    the other way, `eval --json b.json`, compare. Each report records which arm
+    produced it, so the two files cannot be silently mixed up.
+    """
+    try:
+        labels = evaluation.load_labels(args.labels)
+    except evaluation.LabelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        index = VectorIndex.load(config.INDEX_DIR)
+    except FileNotFoundError:
+        print("error: no index found -- run `index` first", file=sys.stderr)
+        return 1
+
+    with Database() as database:
+        database.check_consistency(len(index))
+        embedder = get_embedder()
+        try:
+            report = evaluation.evaluate(
+                labels,
+                index,
+                database,
+                embedder,
+                top_k=args.top_k,
+                ks=args.ks,
+                tolerance_sec=args.tolerance,
+                collapse_window_sec=args.collapse,
+                label_path=args.labels,
+                meta={"model": f"{embedder.model_name}/{embedder.pretrained}",
+                      "device": embedder.device},
+            )
+        except evaluation.LabelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        print()
+        print(report.describe())
+        print()
+
+        if args.json:
+            out = Path(args.json)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
+            print(f"wrote {out}")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the HTTP API. A thin wrapper over uvicorn so the incantation lives
     in one place; the app itself is built in api.py."""
@@ -274,6 +328,44 @@ def build_parser() -> argparse.ArgumentParser:
         "recover", help="repair a store left inconsistent by a crash"
     )
     p_recover.set_defaults(func=cmd_recover)
+
+    p_eval = sub.add_parser("eval", help="score Recall@K against the labelled eval set")
+    p_eval.add_argument(
+        "--labels",
+        default=str(config.EVAL_LABELS_PATH),
+        help="labels JSON (default: eval/labels.json)",
+    )
+    p_eval.add_argument(
+        "-k",
+        "--ks",
+        type=int,
+        nargs="+",
+        default=list(evaluation.DEFAULT_KS),
+        metavar="K",
+        help="report Recall at these depths (default: 1 5 10)",
+    )
+    p_eval.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="fetch depth (default: the largest K reported)",
+    )
+    p_eval.add_argument(
+        "--tolerance",
+        type=float,
+        default=evaluation.DEFAULT_TOLERANCE_SEC,
+        metavar="SEC",
+        help="widen each labelled range by SEC on both sides, absorbing the "
+        "sampling grid (default: %(default)s = one baseline interval)",
+    )
+    p_eval.add_argument(
+        "--collapse",
+        type=float,
+        metavar="SEC",
+        help="merge near-duplicate hits before scoring (A/B the collapse window)",
+    )
+    p_eval.add_argument("--json", metavar="PATH", help="also write the report as JSON")
+    p_eval.set_defaults(func=cmd_eval)
 
     p_search = sub.add_parser("search", help="query the index")
     p_search.add_argument("query", help="natural-language query")

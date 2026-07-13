@@ -163,6 +163,33 @@ class Database:
             ).fetchall()
         return [VideoRow(**dict(r)) for r in rows]
 
+    def searchable_filenames(self) -> set[str]:
+        """Filenames of videos that actually have frames in the index.
+
+        Distinct from `list_videos()`: a video can exist as a row while being
+        `queued` or `failed`, and no query will ever return it. The eval
+        harness validates labels against this, so "your label names a video
+        that cannot be found" and "the video is there but was never ingested"
+        are the same answer -- which is the honest one.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT v.filename FROM videos v JOIN frames f ON f.video_id = v.id"
+        ).fetchall()
+        return {r["filename"] for r in rows}
+
+    def frame_reason_counts(self) -> dict[str, int]:
+        """How many frames came from each sampling reason.
+
+        Lets an eval report say which sampling arm produced the store it
+        measured: zero `scene_cut` frames means the corpus was built with
+        `--fixed-interval`. Without that, two A/B reports are two numbers with
+        no record of what they are comparing.
+        """
+        rows = self.conn.execute(
+            "SELECT reason, COUNT(*) AS n FROM frames GROUP BY reason"
+        ).fetchall()
+        return {r["reason"]: r["n"] for r in rows}
+
     def delete_video(self, video_id: str) -> None:
         """Remove a video and its frames. Does not touch the FAISS index --
         callers must rebuild, since a flat index cannot remove vectors without

@@ -20,3 +20,6 @@ dist/
 
 .DS_Store
 .env
+
+# Eval reports are outputs, not source. eval/labels.json IS committed.
+eval/reports/

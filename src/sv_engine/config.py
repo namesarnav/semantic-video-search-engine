@@ -32,6 +32,13 @@ WEB_DIST_DIR = Path(
     os.environ.get("SV_WEB_DIST", Path(__file__).resolve().parents[2] / "web" / "dist")
 )
 
+# The hand-labelled eval set. Anchored to the checkout, not DATA_DIR: ground
+# truth is authored source that must be committed, and DATA_DIR is gitignored.
+# A metric whose labels are not version-controlled is not reproducible.
+EVAL_LABELS_PATH = Path(
+    os.environ.get("SV_EVAL_LABELS", Path(__file__).resolve().parents[2] / "eval" / "labels.json")
+)
+
 EMBED_BATCH_SIZE = int(os.environ.get("SV_EMBED_BATCH", "32"))
 THUMBNAIL_WIDTH = int(os.environ.get("SV_THUMBNAIL_WIDTH", "384"))
 
