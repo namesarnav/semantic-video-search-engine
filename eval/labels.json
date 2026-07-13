@@ -1,0 +1,99 @@
+{
+  "_readme": "Hand-labelled ground truth for `sv-engine eval`. See eval/README.md.",
+  "queries": [
+    {
+      "query": "a red suspension bridge over water",
+      "note": "Golden Gate, seen from a hillside path through foliage. Runs the whole standalone clip and shot 1 of the compilation.",
+      "targets": [
+        {"video": "15342677_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 9.2},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 0.0, "end_sec": 9.1}
+      ]
+    },
+    {
+      "query": "the golden gate bridge",
+      "note": "Named-landmark phrasing of the same footage. Tests whether CLIP's landmark knowledge carries, where the generic phrasing above tests description.",
+      "targets": [
+        {"video": "15342677_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 9.2},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 0.0, "end_sec": 9.1}
+      ]
+    },
+    {
+      "query": "a snow covered mountain ridge",
+      "targets": [
+        {"video": "15549988_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 11.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 9.2, "end_sec": 20.7}
+      ]
+    },
+    {
+      "query": "aerial view of a snowy peak against clouds",
+      "note": "Camera drifts over the ridge; sky and cloud fill the upper half throughout.",
+      "targets": [
+        {"video": "15549988_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 11.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 9.2, "end_sec": 20.7}
+      ]
+    },
+    {
+      "query": "the sun setting behind a dark mountain",
+      "note": "Within-video moment, not whole-clip: the sun is a visible disc above the ridge early on and is gone by ~7s. Deliberately narrower than the clip so the timestamp has to be right, not just the video.",
+      "targets": [
+        {"video": "16504192_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 5.0},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 20.7, "end_sec": 25.7}
+      ]
+    },
+    {
+      "query": "an orange sunset sky with clouds",
+      "targets": [
+        {"video": "16504192_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 6.0},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 20.7, "end_sec": 26.7}
+      ]
+    },
+    {
+      "query": "riding a motorcycle down a forest road",
+      "note": "First-person over the handlebars; black and white footage.",
+      "targets": [
+        {"video": "16615911_3840_2160_59fps.mp4", "start_sec": 0.0, "end_sec": 10.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 30.3, "end_sec": 40.9}
+      ]
+    },
+    {
+      "query": "handlebars and mirrors of a motorbike",
+      "note": "Object-level rather than scene-level phrasing of the same shot.",
+      "targets": [
+        {"video": "16615911_3840_2160_59fps.mp4", "start_sec": 0.0, "end_sec": 10.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 30.3, "end_sec": 40.9}
+      ]
+    },
+    {
+      "query": "a black and white photo of trees",
+      "note": "Tests that the desaturated grade is itself retrievable, since it is the one thing distinguishing this shot's colour signature from the others.",
+      "targets": [
+        {"video": "16615911_3840_2160_59fps.mp4", "start_sec": 0.0, "end_sec": 10.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 30.3, "end_sec": 40.9}
+      ]
+    },
+    {
+      "query": "a winding road curving to the left",
+      "note": "The road bends noticeably in the last few seconds of the motorcycle shot, and runs straight before it. A genuinely within-shot moment.",
+      "targets": [
+        {"video": "16615911_3840_2160_59fps.mp4", "start_sec": 8.0, "end_sec": 10.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 38.0, "end_sec": 40.9}
+      ]
+    },
+    {
+      "query": "a dirt path through green bushes",
+      "note": "Foreground of the bridge shot: the trail and hillside scrub, not the bridge itself.",
+      "targets": [
+        {"video": "15342677_3840_2160_30fps.mp4", "start_sec": 0.0, "end_sec": 9.2},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 0.0, "end_sec": 9.1}
+      ]
+    },
+    {
+      "query": "a nearly black frame after dark",
+      "note": "The last seconds of the sunset clip, once the sun is below the ridge. Almost no visual signal -- expected to be the hardest label here, and a useful one to keep failing honestly rather than to delete.",
+      "targets": [
+        {"video": "16504192_3840_2160_30fps.mp4", "start_sec": 8.0, "end_sec": 9.6},
+        {"video": "multishot_4cuts_720p.mp4", "start_sec": 28.0, "end_sec": 30.3}
+      ]
+    }
+  ]
+}
