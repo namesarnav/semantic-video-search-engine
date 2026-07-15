@@ -423,6 +423,52 @@ def _check_labels_against_corpus(labels: Sequence[Label], database: Database) ->
         )
 
 
+@dataclass(frozen=True)
+class CoverageReport:
+    """Which ground-truth shots the sampler actually put a frame inside."""
+
+    covered: tuple[int, ...]
+    missed: tuple[int, ...]
+    total: int
+
+    @property
+    def fraction(self) -> float:
+        return len(self.covered) / self.total if self.total else 0.0
+
+    def describe(self) -> str:
+        return (
+            f"{len(self.covered)}/{self.total} shots covered "
+            f"({self.fraction:.1%})"
+            + (f", missed {list(self.missed)}" if self.missed else "")
+        )
+
+
+def shot_coverage(
+    sampled_timestamps: Iterable[float], shots: Sequence[tuple[float, float]]
+) -> CoverageReport:
+    """Fraction of shots containing at least one sampled frame.
+
+    This measures the *sampler*, not the retriever -- no CLIP, no index, no
+    queries. It exists because Recall@K alone cannot distinguish two very
+    different A/B outcomes: "scene-aware captured shots that baseline missed,
+    and retrieval improved" from "scene-aware captured them and retrieval did
+    not improve anyway". The second is a finding about CLIP rather than about
+    sampling, and only coverage separates them.
+
+    Shots are half-open ``[start, end)``. They abut, so counting a sample that
+    lands exactly on a boundary for both neighbours would inflate coverage at
+    every cut -- which is precisely where the interesting samples are.
+    """
+    timestamps = sorted(sampled_timestamps)
+    covered = tuple(
+        i
+        for i, (start, end) in enumerate(shots)
+        if any(start <= t < end for t in timestamps)
+    )
+    missed = tuple(i for i in range(len(shots)) if i not in set(covered))
+    return CoverageReport(covered=covered, missed=missed, total=len(shots))
+
+
 def _percentile(values: Sequence[float], pct: float) -> float:
     """Nearest-rank percentile.
 

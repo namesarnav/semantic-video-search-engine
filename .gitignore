@@ -23,3 +23,7 @@ dist/
 
 # Eval reports are outputs, not source. eval/labels.json IS committed.
 eval/reports/
+
+# The A/B scratch stores and generated corpus (regenerate with scripts/).
+data/ab/
+data/eval-cutdense/

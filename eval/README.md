@@ -61,29 +61,81 @@ baseline interval from the moment a human read off the clock. Scoring strictly
 would charge the retriever for the sampler's grid. Lower it only alongside a
 denser `--baseline-fps`.
 
-## The sampling A/B
+## The sampling A/B — settled
 
-`eval` reads the store as it stands and never re-ingests, so the A/B is two
-runs over two builds of the same corpus:
+**Scene-aware sampling wins: Recall@5 100% vs 85.7% for fixed-interval, +14.3
+points on the queries CLIP can answer at all.**
+
+This could not be measured on the real corpus, and that is worth understanding
+before trusting the number. Scene-aware sampling contributes exactly 3 frames
+out of 87 there: only `multishot_4cuts_720p.mp4` has any detected cuts, and the
+other four videos are single continuous shots. Both arms score identically, and
+that tie says nothing about the design.
+
+So the A/B runs on a purpose-built corpus:
 
 ```bash
-uv run python -m sv_engine.cli index data/videos --rebuild
-uv run python -m sv_engine.cli eval --json eval/reports/scene-aware.json
-
-uv run python -m sv_engine.cli index data/videos --rebuild --fixed-interval
-uv run python -m sv_engine.cli eval --json eval/reports/fixed-interval.json
+uv run python scripts/make_cut_dense_corpus.py   # once; regenerates the video
+uv run python scripts/run_sampling_ab.py
 ```
 
-Every report records which arm produced it (`sampling.arm`, inferred from
-whether any frame has `reason = scene_cut`), so the two files cannot be
-silently mixed up. `--rebuild` is required: it drops index, database and
-thumbnails together, and a store half-built by each arm measures neither.
+`cut_dense.mp4` is 16 shots cut together — 8 sub-second, 8 sustained — built
+from the four source clips crossed with four visual treatments so every shot is
+uniquely addressable by one query. Boundaries are known by construction, which
+is why it scores at **tolerance 0**: the ranges are exact and abut, so the
+default 1s tolerance would let a frame from the neighbouring shot count as a
+hit. The runner ingests into scratch stores under `data/ab/`, so **the main
+store is never touched**.
 
-Reports are outputs, not source, and are gitignored.
+Result:
 
-## Caveat on the current corpus
+| arm | frames | shot coverage | R@1 | R@5 | R@10 |
+|---|---|---|---|---|---|
+| scene-aware | 43 | 100.0% | 81.2% | 93.8% | 100.0% |
+| fixed-interval | 28 | 81.2% | 68.8% | 81.2% | 81.2% |
+| dense (control) | 277 | 100.0% | 68.8% | 87.5% | 87.5% |
 
-Five videos, 12 queries. That is enough to catch a broken retriever and not
-nearly enough to resolve a few points of difference between two sampling
-strategies — one query is 8.3 percentage points. Treat small gaps as noise
-until there is more footage in `data/videos`.
+Two queries changed outcome, both sub-second shots (0.63s and 0.57s), found
+only by scene-aware. Fixed-interval put no frame inside them at all.
+
+**Why coverage is reported alongside recall.** Recall alone cannot separate
+"scene-aware captured shots baseline missed and retrieval improved" from
+"captured them and retrieval did not improve anyway" — the second is a finding
+about CLIP, not about sampling. Here the two agree: coverage rises 81.2% →
+100%, and exactly the shots that gained coverage are the ones that became
+findable. That agreement is the actual evidence.
+
+**Why there is a dense control arm.** Some queries fail because CLIP cannot see
+"sepia", not because of sampling. Filtering those out using either test arm's
+own successes would bias the comparison toward it, so the filter comes from a
+10 fps arm that captures every shot and is neutral between the two. 14 of 16
+queries are answerable by that standard; both filtered and unfiltered numbers
+are printed.
+
+Reports are outputs, not source, and are gitignored. The video is regenerated
+by the script; the labels and shot manifest are committed.
+
+## Caveats
+
+**The real corpus is small.** Five videos, 12 queries; one query is 8.3
+percentage points. Enough to catch a broken retriever, not enough to resolve a
+few points of difference.
+
+**The cut-dense corpus is synthetic.** It tests one specific design claim —
+that sparse sampling misses short distinct moments — directly and honestly, and
+is not a substitute for real-world recall. `labels.json` remains the headline
+number. 16 queries means one query is 6.25 points, so only a large,
+one-directional difference is signal; the +14.3 point gap here is two queries
+wide and is corroborated by the independent coverage measure, which is why it
+is reported as a result rather than as noise.
+
+**The four treatments are a device**, not a claim that people search by colour
+grade. They exist so each shot has exactly one correct answer.
+
+**A drift bug worth remembering.** The first version of the builder rounded
+shot durations to 1/100s while the renderer wrote whole frames, so the declared
+boundaries drifted from the rendered ones and the ground truth pointed at the
+neighbouring shot's content. It produced a coherent-looking but entirely false
+result: 100% coverage with *worse* recall. Boundaries are now derived from
+cumulative frame counts, and `test_cut_dense_corpus.py` pins it. Ground truth
+that is generated still has to be verified against the artefact it describes.
