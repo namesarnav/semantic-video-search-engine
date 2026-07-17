@@ -1,0 +1,23 @@
+# The build context is 1.2GB without this, almost all of it things the image
+# must not contain anyway: 258MB of source videos, a macOS-built virtualenv,
+# and node_modules that the build stage installs for itself.
+
+.venv/
+**/node_modules/
+web/dist/
+
+# Ingested store and generated corpora. The container gets its own /data
+# volume; baking a host store into the image would ship someone else's
+# index and database.
+data/
+
+.git/
+.pytest_cache/
+__pycache__/
+**/*.py[cod]
+*.tsbuildinfo
+
+eval/reports/
+
+.DS_Store
+.env

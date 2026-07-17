@@ -1,0 +1,39 @@
+# `docker compose up` is meant to be the only setup step -- see CLAUDE.md.
+#
+#   docker compose up --build                                   # API + UI on :8000
+#   docker compose run --rm sv-engine sv-engine index /videos   # ingest host footage
+#   docker compose run --rm sv-engine sv-engine videos          # status per video
+#   docker compose run --rm sv-engine sv-engine eval            # Recall@K
+#
+# `run` starts a sibling container sharing the volume, so anything it ingests
+# is on disk immediately -- but the already-running server loaded its index at
+# startup and will not see the new vectors until `docker compose restart`.
+# To avoid that entirely, ingest through the API instead:
+#   curl -X POST localhost:8000/videos -H 'Content-Type: application/json' \
+#        -d '{"path": "/videos/your-clip.mp4"}'
+#
+# The image is CPU-only by design: Docker on macOS has no MPS passthrough, so
+# ingestion here is markedly slower than a native `uv run`. Use this for
+# reproducibility and the demo path; do embedding work on the host.
+
+services:
+  sv-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sv-engine:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # The store -- index, database, thumbnails, and anything uploaded
+      # through the API -- so an ingested corpus survives `down` and `up`.
+      - sv-data:/data
+      # Host footage, mounted read-only at a path of its own rather than over
+      # /data/videos. That directory has to stay writable: POST /videos/upload
+      # saves into it, and mounting a read-only bind there would break that
+      # endpoint at runtime rather than at startup.
+      - ./data/videos:/videos:ro
+    restart: unless-stopped
+
+volumes:
+  sv-data:

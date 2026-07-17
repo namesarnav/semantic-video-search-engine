@@ -21,7 +21,25 @@ dependencies = [
 ]
 
 [project.scripts]
-sv-engine = "sv_engine:main"
+# sv_engine.cli, not sv_engine: the package root has no main, so this was an
+# ImportError for anyone invoking `sv-engine` rather than `python -m`.
+# Importing the submodule still runs sv_engine/__init__ first, so the
+# torch-before-faiss ordering that file guarantees is unaffected.
+sv-engine = "sv_engine.cli:main"
+
+# Docker on macOS has no MPS passthrough, so the container is CPU-only by
+# design -- but on linux the default torch wheels drag in the entire CUDA
+# toolkit, several gigabytes of it, for hardware the container cannot reach.
+# Pinning linux to the CPU index keeps the image honest about what it runs.
+# macOS resolution is untouched: the marker scopes this to linux only.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
