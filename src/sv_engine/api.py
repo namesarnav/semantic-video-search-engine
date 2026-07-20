@@ -27,18 +27,28 @@ SQLite connections cannot cross threads, so each request and task opens its own.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import shutil
 import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Iterator, Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, recovery
@@ -52,6 +62,53 @@ logger = logging.getLogger(__name__)
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
 StatusFilter = Literal["queued", "processing", "done", "failed"]
+
+# Range reads are streamed in blocks rather than held in memory: a seek into a
+# 120MB 4K clip should not cost 120MB of RSS per viewer.
+_STREAM_CHUNK = 256 * 1024
+
+
+def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Parse a single-range `bytes=start-end`, or None to serve the whole file.
+
+    Returns None rather than raising for anything unrecognised -- an
+    unparseable Range is not a client error worth a 416, and RFC 9110 says to
+    ignore it and send the full representation. Multi-range requests are
+    treated the same way: browsers do not use them for video, and the
+    multipart response they require is not worth implementing unused.
+    """
+    if not header:
+        return None
+    units, _, spec = header.partition("=")
+    if units.strip().lower() != "bytes" or "," in spec:
+        return None
+
+    start_text, _, end_text = spec.partition("-")
+    start_text, end_text = start_text.strip(), end_text.strip()
+    try:
+        if not start_text:
+            # A suffix range: the last N bytes.
+            if not end_text:
+                return None
+            length = int(end_text)
+            if length <= 0:
+                return None
+            return max(0, size - length), size - 1
+        start = int(start_text)
+        if start < 0:
+            return None
+        if start >= size:
+            # Well-formed but unsatisfiable, which is a 416 rather than
+            # something to ignore. Hand it back so the caller can say so.
+            return start, max(size - 1, 0)
+        # Clamp rather than reject: browsers routinely probe past the end.
+        end = min(int(end_text), size - 1) if end_text else size - 1
+    except ValueError:
+        return None
+    if end < start:
+        # e.g. "bytes=5-2": an invalid range-spec, ignored per RFC 9110.
+        return None
+    return start, end
 
 
 # ---- shared state ---------------------------------------------------------
@@ -124,6 +181,7 @@ class VideoSummary(BaseModel):
     status: str
     duration_sec: float
     frame_count: int
+    video_url: str
     error: str | None = None
     ingested_at: str | None = None
 
@@ -151,6 +209,10 @@ class SearchHitModel(BaseModel):
     filename: str
     timestamp_sec: float
     thumbnail_url: str
+    # The source video, so a client can play the moment rather than only show
+    # a still of it. A URL for the same reason thumbnail_url is one: the
+    # server's filesystem layout is not the client's business.
+    video_url: str
     reason: str
     frame_id: int
 
@@ -284,6 +346,7 @@ def create_app(state: AppState) -> FastAPI:
                         status=row.status,
                         duration_sec=row.duration_sec,
                         frame_count=database.frame_count(video_id=row.id),
+                        video_url=f"/videos/{row.id}/file",
                         error=row.error,
                         ingested_at=row.ingested_at,
                     )
@@ -303,6 +366,7 @@ def create_app(state: AppState) -> FastAPI:
                 status=row.status,
                 duration_sec=row.duration_sec,
                 frame_count=database.frame_count(video_id=row.id),
+                video_url=f"/videos/{row.id}/file",
                 error=row.error,
                 ingested_at=row.ingested_at,
             )
@@ -335,11 +399,78 @@ def create_app(state: AppState) -> FastAPI:
                     # A URL the browser can fetch. Never the server's filesystem
                     # path, which leaks layout and is useless to a client.
                     thumbnail_url=f"/thumbnails/{hit.frame_id}",
+                    video_url=f"/videos/{hit.video_id}/file",
                     reason=hit.reason,
                     frame_id=hit.frame_id,
                 )
                 for hit in hits
             ],
+        )
+
+    @app.get("/videos/{video_id}/file")
+    def video_file(video_id: str, request: Request) -> Response:
+        """Stream the source video, with byte-range support so it can seek.
+
+        Range handling is written out rather than delegated because seeking is
+        the whole reason this endpoint exists: a result is a moment inside a
+        video, and without a 206 the browser has to fetch the entire file
+        before it can jump to that moment. On a 4K clip that is the difference
+        between instant and unusable.
+
+        Only paths recorded in `videos.path` are reachable -- the video id is
+        a content hash the caller cannot use to name an arbitrary file.
+        """
+        with state.open_db() as database:
+            row = database.get_video(video_id)
+        if row is None:
+            raise HTTPException(404, f"unknown video: {video_id}")
+
+        path = Path(row.path)
+        if not path.is_file():
+            raise HTTPException(
+                404, f"video file missing on disk for {video_id}: {row.filename}"
+            )
+
+        media_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
+        size = path.stat().st_size
+        span = _parse_range(request.headers.get("range"), size)
+
+        # Note this streams even the whole-file case rather than handing back a
+        # FileResponse. FileResponse re-parses Range itself and answers 400 for
+        # a unit it does not recognise, but RFC 9110 requires an unknown range
+        # unit to be *ignored* and the full representation sent.
+        partial = span is not None
+        start, end = span if span else (0, max(size - 1, 0))
+        if partial and start >= size:
+            raise HTTPException(
+                416,
+                f"range starts at {start} but the file is {size} bytes",
+                headers={"Content-Range": f"bytes */{size}"},
+            )
+
+        def chunks() -> Iterator[bytes]:
+            remaining = end - start + 1
+            with path.open("rb") as handle:
+                handle.seek(start)
+                while remaining > 0:
+                    block = handle.read(min(_STREAM_CHUNK, remaining))
+                    if not block:
+                        break
+                    remaining -= len(block)
+                    yield block
+
+        headers = {
+            "Content-Length": str(end - start + 1),
+            "Accept-Ranges": "bytes",
+        }
+        if partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+        return StreamingResponse(
+            chunks(),
+            status_code=206 if partial else 200,
+            media_type=media_type,
+            headers=headers,
         )
 
     @app.get("/thumbnails/{frame_id}")

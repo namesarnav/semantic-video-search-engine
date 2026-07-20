@@ -12,6 +12,8 @@ export interface SearchHit {
   filename: string;
   timestamp_sec: number;
   thumbnail_url: string;
+  /** Source video, so a match can be played rather than only shown. */
+  video_url: string;
   reason: string;
   frame_id: number;
 }
@@ -30,6 +32,17 @@ export interface SearchOptions {
 
 /** FastAPI puts the message in `detail`, as a string for HTTPException and a
  * list of field errors for a 422. Neither is worth showing raw. */
+export interface VideoSummary {
+  id: string;
+  filename: string;
+  status: "queued" | "processing" | "done" | "failed";
+  duration_sec: number;
+  frame_count: number;
+  video_url: string;
+  error: string | null;
+  ingested_at: string | null;
+}
+
 async function messageFor(response: Response): Promise<string> {
   try {
     const body = await response.json();
@@ -39,7 +52,53 @@ async function messageFor(response: Response): Promise<string> {
   } catch {
     // A proxy or a crashed worker can answer with HTML; fall through.
   }
-  return `search failed (${response.status})`;
+  return `request failed (${response.status})`;
+}
+
+async function json<T>(response: Response): Promise<T> {
+  if (!response.ok) throw new Error(await messageFor(response));
+  return (await response.json()) as T;
+}
+
+/** Everything the library tab shows: what is ingested and how it is doing. */
+export async function listVideos(): Promise<VideoSummary[]> {
+  const response = await fetch("/videos");
+  const body = await json<{ videos: VideoSummary[] }>(response);
+  return body.videos;
+}
+
+/** Queue a server-side path. Returns 202 -- the work happens afterwards, so
+ * the caller has to poll rather than assume the video is ready. */
+export async function ingestPath(
+  path: string,
+): Promise<{ video_id: string; filename: string; status: string }> {
+  return json(
+    await fetch("/videos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: path.trim() }),
+    }),
+  );
+}
+
+export async function uploadVideo(
+  file: File,
+): Promise<{ video_id: string; filename: string; status: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  return json(await fetch("/videos/upload", { method: "POST", body: form }));
+}
+
+export interface Health {
+  status: string;
+  videos: number;
+  frames: number;
+  vectors: number;
+  device: string;
+}
+
+export async function getHealth(): Promise<Health> {
+  return json(await fetch("/health"));
 }
 
 export async function searchVideos(
