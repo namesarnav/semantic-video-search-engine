@@ -27,3 +27,6 @@ eval/reports/
 # The A/B scratch stores and generated corpus (regenerate with scripts/).
 data/ab/
 data/eval-cutdense/
+
+# Fetched video corpus (382MB of Pexels clips), never committed.
+corpus/
