@@ -25,7 +25,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .db import Database
 from .embedder import ClipEmbedder
@@ -480,3 +480,89 @@ def _percentile(values: Sequence[float], pct: float) -> float:
     ordered = sorted(values)
     rank = max(1, min(len(ordered), int(round(pct / 100 * len(ordered) + 0.5))))
     return ordered[rank - 1]
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """A paired comparison of two eval reports over the same queries.
+
+    Deltas alone hide churn: a +2 point result made of nine wins and seven
+    losses says something very different about a change from one made of two
+    wins and no losses. Both are kept.
+    """
+
+    ks: tuple[int, ...]
+    ranks: dict[str, dict[str, int | None]]  # side -> query -> rank
+    labels: tuple[str, str] = ("baseline", "candidate")
+
+    def _hits(self, side: str, k: int) -> set[str]:
+        return {
+            q for q, rank in self.ranks[side].items() if rank is not None and rank <= k
+        }
+
+    def recall(self, side: str, k: int) -> float:
+        total = len(self.ranks[side])
+        return len(self._hits(side, k)) / total if total else 0.0
+
+    def delta(self, k: int) -> float:
+        return self.recall("candidate", k) - self.recall("baseline", k)
+
+    def gained(self, k: int) -> list[str]:
+        """Queries the candidate finds within k and the baseline does not."""
+        return sorted(self._hits("candidate", k) - self._hits("baseline", k))
+
+    def lost(self, k: int) -> list[str]:
+        return sorted(self._hits("baseline", k) - self._hits("candidate", k))
+
+    def describe(self, show: int = 6) -> str:
+        base, cand = self.labels
+        width = max(len(base), len(cand), 9)
+        lines = [
+            f"{'':<{width}}  " + "".join(f"{'R@' + str(k):>9}" for k in self.ks),
+            f"{base:<{width}}  "
+            + "".join(f"{self.recall('baseline', k):>9.1%}" for k in self.ks),
+            f"{cand:<{width}}  "
+            + "".join(f"{self.recall('candidate', k):>9.1%}" for k in self.ks),
+            f"{'delta':<{width}}  "
+            + "".join(f"{self.delta(k):>+9.1%}" for k in self.ks),
+        ]
+        for k in self.ks:
+            gained, lost = self.gained(k), self.lost(k)
+            if not gained and not lost:
+                continue
+            lines += ["", f"R@{k}: +{len(gained)} gained, -{len(lost)} lost"]
+            for query in gained[:show]:
+                lines.append(f'  + "{query}"')
+            for query in lost[:show]:
+                lines.append(f'  - "{query}"')
+            if len(gained) > show or len(lost) > show:
+                lines.append(f"  ... ({len(gained) + len(lost)} total)")
+        return "\n".join(lines)
+
+
+def compare_reports(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    ks: Iterable[int] = DEFAULT_KS,
+    labels: tuple[str, str] = ("baseline", "candidate"),
+) -> Comparison:
+    """Pair two `EvalReport.to_dict()` payloads by query text.
+
+    Refuses mismatched query sets. Intersecting them would quietly report a
+    delta over whichever queries happened to overlap, which is not the
+    comparison anyone intended to run.
+    """
+    sides = {}
+    for name, payload in (("baseline", baseline), ("candidate", candidate)):
+        sides[name] = {o["query"]: o.get("rank") for o in payload.get("outcomes", [])}
+
+    if set(sides["baseline"]) != set(sides["candidate"]):
+        only_a = sorted(set(sides["baseline"]) - set(sides["candidate"]))[:3]
+        only_b = sorted(set(sides["candidate"]) - set(sides["baseline"]))[:3]
+        raise ValueError(
+            "the two reports cover different queries; they were scored against "
+            f"different label sets. Only in {labels[0]}: {only_a}. "
+            f"Only in {labels[1]}: {only_b}."
+        )
+
+    return Comparison(ks=tuple(sorted(set(ks))), ranks=sides, labels=labels)
