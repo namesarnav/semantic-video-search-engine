@@ -1,6 +1,7 @@
 # `docker compose up` is meant to be the only setup step -- see CLAUDE.md.
 #
 #   docker compose up --build                                   # API + UI on :8000
+#   docker compose run --rm sv-engine sv-engine index /corpus   # ingest the corpus
 #   docker compose run --rm sv-engine sv-engine index /videos   # ingest host footage
 #   docker compose run --rm sv-engine sv-engine videos          # status per video
 #   docker compose run --rm sv-engine sv-engine eval            # Recall@K
@@ -33,6 +34,10 @@ services:
       # saves into it, and mounting a read-only bind there would break that
       # endpoint at runtime rather than at startup.
       - ./data/videos:/videos:ro
+      # The fetched corpus, likewise read-only. Without this the container
+      # cannot see the bulk of the footage at all, and the demo runs against
+      # whatever few clips happen to be in data/videos.
+      - ./corpus:/corpus:ro
     restart: unless-stopped
 
 volumes:
