@@ -113,16 +113,24 @@ def ingest_video(
         )
 
     if existing is not None and database.frame_count(video_id) > 0:
-        # `force` bypasses the skip above, but the previous run's frames are
-        # still indexed and their vectors sit in the middle of a flat index,
-        # where they cannot be removed without shifting every id after them.
-        # Adding a second set would silently double every hit for this video,
-        # so refuse and point at the one operation that is safe.
-        raise ValueError(
-            f"{path.name} already has {database.frame_count(video_id)} indexed "
-            "frames; re-ingesting would duplicate them. Use --rebuild to drop "
-            "the index, database and thumbnails together and start over."
-        )
+        # The previous run's frames are still indexed, and their vectors sit in
+        # the middle of a flat index. Adding a second set would silently double
+        # every hit for this video, so the old ones are compacted out first --
+        # index rebuilt and every surviving vector_index_id renumbered, as one
+        # crash-repairable unit. See compaction.py for why that needs a marker.
+        from .compaction import drop_video
+
+        if index_dir is None:
+            # Compaction swaps a file on disk, so it needs to know which one.
+            # Refusing beats guessing at config.INDEX_DIR: that guess once let
+            # a unit test overwrite a real index.
+            raise ValueError(
+                f"{path.name} already has {database.frame_count(video_id)} indexed "
+                "frames, so re-ingesting must first compact the old ones out -- "
+                "which needs an explicit index_dir. Pass one, or use --rebuild."
+            )
+        drop_video(video_id, index, database, index_dir=index_dir)
+        existing = None
 
     # Register the video before anything that can fail. Probing a corrupt file
     # raises, and a video that vanishes with no row at all is exactly the

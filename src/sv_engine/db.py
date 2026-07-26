@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS frames (
     vector_index_id INTEGER NOT NULL UNIQUE   -- position in the FAISS index
 );
 
+-- Small key/value store for state that belongs to the store as a whole
+-- rather than to any video. Currently: the compaction swap marker, which is
+-- how a half-finished index rebuild is recognised and completed after a crash.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_frames_video ON frames(video_id);
 CREATE INDEX IF NOT EXISTS idx_frames_vector ON frames(vector_index_id);
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
@@ -162,6 +170,26 @@ class Database:
                 "SELECT * FROM videos WHERE status = ? ORDER BY filename", (status,)
             ).fetchall()
         return [VideoRow(**dict(r)) for r in rows]
+
+    # ---- meta ---------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def delete_meta(self, key: str) -> None:
+        self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.commit()
 
     def searchable_filenames(self) -> set[str]:
         """Filenames of videos that actually have frames in the index.

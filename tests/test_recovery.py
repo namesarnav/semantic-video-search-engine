@@ -317,31 +317,49 @@ def test_the_index_is_durable_before_the_rows_are_committed(
     assert seen == [result.frames_indexed]
 
 
-def test_force_will_not_duplicate_an_already_indexed_video(
+def test_force_reingests_without_duplicating(
     database, index, synthetic_video, tmp_path
 ):
-    """``--force`` re-ingests, but a flat index cannot drop the old vectors --
-    they sit below newer ones and removing them would shift every id after.
-    Adding a second set would silently double every hit for this video, so the
-    only honest answer is to refuse and point at ``--rebuild``.
+    """``--force`` used to refuse, because a flat index cannot drop vectors
+    sitting below newer ones without shifting every id after them. It now
+    compacts them out first: the index is rebuilt and every surviving
+    vector_index_id renumbered, as one crash-repairable unit.
+
+    The thing that must not happen is a second set of frames stacking on top
+    of the first, which would silently double every hit for this video.
     """
     path = synthetic_video(duration_sec=3.0, cut_at_sec=1.5)
     thumbs = tmp_path / "thumbs"
+    index_dir = tmp_path / "index"
     first = ingest_video(
-        path, index, database, StubEmbedder(), baseline_fps=1.0, thumbnail_dir=thumbs
+        path,
+        index,
+        database,
+        StubEmbedder(),
+        baseline_fps=1.0,
+        thumbnail_dir=thumbs,
+        index_dir=index_dir,
     )
 
-    with pytest.raises(ValueError, match="rebuild"):
-        ingest_video(
-            path,
-            index,
-            database,
-            StubEmbedder(),
-            baseline_fps=1.0,
-            force=True,
-            thumbnail_dir=thumbs,
-        )
+    second = ingest_video(
+        path,
+        index,
+        database,
+        StubEmbedder(),
+        baseline_fps=1.0,
+        force=True,
+        thumbnail_dir=thumbs,
+        index_dir=index_dir,
+    )
 
-    assert database.frame_count() == first.frames_indexed
+    assert not second.skipped
+    assert database.frame_count() == first.frames_indexed == second.frames_indexed
+    # Index and database still agree, and ids are still positions.
+    database.check_consistency(len(index))
+    ids = sorted(
+        r["vector_index_id"]
+        for r in database.conn.execute("SELECT vector_index_id FROM frames")
+    )
+    assert ids == list(range(len(index)))
     assert database.get_video(first.video_id).status == db.DONE
     database.check_consistency(len(index))

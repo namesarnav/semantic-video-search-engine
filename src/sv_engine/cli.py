@@ -300,7 +300,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="discard index, database and thumbnails, then re-ingest everything",
     )
     p_index.add_argument(
-        "--force", action="store_true", help="re-ingest videos already marked done"
+        "--force",
+        action="store_true",
+        help="re-ingest videos already marked done, compacting the old frames "
+        "out of the index first",
     )
     p_index.add_argument(
         "--fixed-interval",

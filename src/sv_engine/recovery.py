@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import db
+from . import config, db
 from .db import Database
 from .index import VectorIndex
 
@@ -60,6 +60,9 @@ class RecoveryReport:
     dropped_videos: list[str] = field(default_factory=list)
     dropped_frames: int = 0
     dropped_vectors: int = 0
+    # What compaction repair did, if anything -- a compaction interrupted by
+    # a crash is finished or discarded before the rest of the pass runs.
+    compaction: str | None = None
 
     @property
     def clean(self) -> bool:
@@ -68,12 +71,15 @@ class RecoveryReport:
             or self.dropped_videos
             or self.dropped_frames
             or self.dropped_vectors
+            or self.compaction
         )
 
     def describe(self) -> str:
         if self.clean:
             return "store is consistent; nothing to recover"
         parts = []
+        if self.compaction:
+            parts.append(self.compaction)
         if self.swept:
             parts.append(f"{len(self.swept)} interrupted video(s) marked failed")
         if self.dropped_videos:
@@ -149,7 +155,25 @@ def recover(
     database: Database,
     index_dir: Path | str | None = None,
 ) -> RecoveryReport:
-    """Full startup pass: sweep abandoned videos, then reconcile the store."""
+    """Full startup pass: finish any interrupted compaction, sweep abandoned
+    videos, then reconcile the store.
+
+    Compaction repair runs **first and reloads the index**. It decides which
+    index file is the live one, so reconciling before it would compare the
+    database against a file that is about to be replaced -- and conclude,
+    correctly but uselessly, that they disagree.
+    """
+    from . import compaction  # local: compaction imports VectorIndex
+
+    directory = Path(index_dir) if index_dir is not None else config.INDEX_DIR
+    compacted = compaction.repair(database, index_dir=directory)
+    if compacted:
+        # The file on disk may have just changed underneath this process.
+        try:
+            index.index = VectorIndex.load(directory).index
+        except FileNotFoundError:
+            pass
+
     swept = sweep_interrupted(database)
     reconciled = reconcile(index, database, index_dir=index_dir)
     return RecoveryReport(
@@ -157,4 +181,5 @@ def recover(
         dropped_videos=reconciled.dropped_videos,
         dropped_frames=reconciled.dropped_frames,
         dropped_vectors=reconciled.dropped_vectors,
+        compaction=compacted,
     )
