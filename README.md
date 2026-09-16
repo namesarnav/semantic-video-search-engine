@@ -11,6 +11,17 @@ across every video you have ingested, each one playable at the moment it matched
 It searches **visual content**. It is deliberately not transcript search, not OCR,
 and not caption search.
 
+# How to use
+
+1. Clone the Repo
+```bash
+git clone git@github.com:namesarnav/semantic-video-search-engine.git
+```
+2. cd to the project
+```bash
+cd semantic-video-search-engine 
+```
+3. Run with docker compose
 ```bash
 docker compose up --build          # API + UI on http://localhost:8000
 ```
