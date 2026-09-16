@@ -21,10 +21,11 @@ git clone git@github.com:namesarnav/semantic-video-search-engine.git
 ```bash
 cd semantic-video-search-engine 
 ```
-3. Run with docker compose
+3. Run with docker compose (make sure Docker daemon is running)
 ```bash
-docker compose up --build          # API + UI on http://localhost:8000
+docker compose up --build         
 ```
+4. Go to `http://localhost:8000`
 
 ## How it works
 
